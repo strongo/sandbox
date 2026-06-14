@@ -1,0 +1,30 @@
+name: Go CI
+
+on:
+  push:
+    branches-ignore:
+      - renovate/**
+    tags:
+      - 'v[0-9]+\.[0-9]+\.[0-9]+' # Push events to matching v*, i.e. v20.15.10
+    paths:
+      - '.github/workflows/**.yml'
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/**.yml'
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+
+jobs:
+
+  strongo_workflow:
+    permissions:
+      contents: write
+    uses: strongo/go-ci-action/.github/workflows/workflow.yml@main
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
