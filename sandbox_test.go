@@ -12,6 +12,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -30,7 +31,7 @@ func TestBuildSpec_AppliesHardenedPresetAndLimits(t *testing.T) {
 		Limits: Limits{CPUs: 2.0, MemoryMB: 1024, PIDs: 256, Network: "bridge"},
 	}
 
-	cfg, hc := buildSpec(j)
+	cfg, hc := buildSpec(j, "")
 
 	if cfg.Image != "runner:latest" {
 		t.Errorf("image = %q", cfg.Image)
@@ -59,8 +60,11 @@ func TestBuildSpec_AppliesHardenedPresetAndLimits(t *testing.T) {
 	for _, o := range hc.SecurityOpt {
 		secOpt[o] = true
 	}
-	if !secOpt["no-new-privileges"] || !secOpt["seccomp=default"] {
-		t.Errorf("SecurityOpt = %v", hc.SecurityOpt)
+	if !secOpt["no-new-privileges"] {
+		t.Errorf("SecurityOpt = %v, want no-new-privileges", hc.SecurityOpt)
+	}
+	if secOpt["seccomp=default"] {
+		t.Error("must not set seccomp=default (unparseable; daemon applies its default)")
 	}
 	if hc.Init == nil || !*hc.Init {
 		t.Error("Init must be true")
@@ -100,7 +104,7 @@ func TestBuildSpec_AppliesHardenedPresetAndLimits(t *testing.T) {
 }
 
 func TestBuildSpec_DefaultNetworkWhenUnset(t *testing.T) {
-	_, hc := buildSpec(Job{Image: "x"})
+	_, hc := buildSpec(Job{Image: "x"}, "")
 	if string(hc.NetworkMode) != DefaultNetwork {
 		t.Errorf("NetworkMode = %q, want default %q", hc.NetworkMode, DefaultNetwork)
 	}
@@ -165,6 +169,9 @@ type fakeClient struct {
 	copyToDst   string // captured dstPath
 	copyToTar   []byte // captured tar bytes
 	copyToCalls int
+
+	volumeCreated bool
+	volumeRemoved bool
 }
 
 func (f *fakeClient) ImageInspect(ctx context.Context, id string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
@@ -204,6 +211,14 @@ func (f *fakeClient) ContainerKill(ctx context.Context, _, _ string) error {
 }
 func (f *fakeClient) ContainerRemove(ctx context.Context, _ string, _ container.RemoveOptions) error {
 	f.removed = true
+	return nil
+}
+func (f *fakeClient) VolumeCreate(ctx context.Context, _ volume.CreateOptions) (volume.Volume, error) {
+	f.volumeCreated = true
+	return volume.Volume{Name: "vol-1"}, nil
+}
+func (f *fakeClient) VolumeRemove(ctx context.Context, _ string, _ bool) error {
+	f.volumeRemoved = true
 	return nil
 }
 func (f *fakeClient) CopyToContainer(ctx context.Context, _, dstPath string, content io.Reader, _ container.CopyToContainerOptions) error {
@@ -368,24 +383,45 @@ func TestRunOnce_InjectionErrorIsFatalAndCleansUp(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error when injection fails")
 	}
-	if fc.started {
-		t.Error("container must not start when injection failed")
-	}
+	// Injection happens in the prep container; on failure the run must abort
+	// before the main container and clean up the prep container + input volume.
 	if !fc.removed {
-		t.Error("container must still be removed after injection failure")
+		t.Error("prep container must still be removed after injection failure")
+	}
+	if !fc.volumeRemoved {
+		t.Error("input volume must be removed after injection failure")
 	}
 }
 
-func TestBuildSpec_InputDirDefaultsToWorkspaceTmpfs(t *testing.T) {
-	_, hc := buildSpec(Job{Image: "x", InputTar: strings.NewReader("")})
-	// Default input dir /workspace is already a preset tmpfs path: no extra mount.
+func TestBuildSpec_InjectedInputDirIsVolumeNotTmpfs(t *testing.T) {
+	// When a tar is injected, the input dir must be a writable VOLUME (present at
+	// create time) — not tmpfs, which only mounts at start and would make the
+	// pre-start CopyToContainer hit the read-only rootfs.
+	_, hc := buildSpec(Job{Image: "x"}, "vol-9")
+	if _, ok := hc.Tmpfs["/workspace"]; ok {
+		t.Error("/workspace must NOT be tmpfs when an input volume is given")
+	}
+	found := false
+	for _, m := range hc.Mounts {
+		if string(m.Type) == "volume" && m.Target == "/workspace" && m.Source == "vol-9" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected named volume vol-9 at /workspace, got mounts %+v", hc.Mounts)
+	}
+}
+
+func TestBuildSpec_NoInputTarKeepsWorkspaceTmpfs(t *testing.T) {
+	// Without an injected tar, /workspace stays tmpfs (writes happen at runtime).
+	_, hc := buildSpec(Job{Image: "x"}, "")
 	if _, ok := hc.Tmpfs["/workspace"]; !ok {
-		t.Error("/workspace tmpfs missing")
+		t.Error("/workspace tmpfs missing when no tar injected")
 	}
 }
 
 func TestBuildSpec_CustomInputDirGetsWritableTmpfs(t *testing.T) {
-	_, hc := buildSpec(Job{Image: "x", InputDir: "/repo"})
+	_, hc := buildSpec(Job{Image: "x", InputDir: "/repo"}, "")
 	opt, ok := hc.Tmpfs["/repo"]
 	if !ok {
 		t.Fatal("custom InputDir /repo did not get a tmpfs mount")
@@ -396,7 +432,7 @@ func TestBuildSpec_CustomInputDirGetsWritableTmpfs(t *testing.T) {
 }
 
 func TestBuildSpec_InputDirUnderWorkspaceReusesTmpfs(t *testing.T) {
-	_, hc := buildSpec(Job{Image: "x", InputDir: "/workspace/src"})
+	_, hc := buildSpec(Job{Image: "x", InputDir: "/workspace/src"}, "")
 	// Nested under an existing tmpfs path => no separate mount added.
 	if _, ok := hc.Tmpfs["/workspace/src"]; ok {
 		t.Error("/workspace/src should reuse /workspace tmpfs, not add its own")

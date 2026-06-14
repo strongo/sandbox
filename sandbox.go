@@ -11,8 +11,8 @@
 // profiles.
 //
 // Security flags (read-only rootfs, CAP_DROP=ALL, non-root 65532,
-// no-new-privileges, seccomp=default, init) are applied unconditionally via
-// the shared isolation preset and cannot be weakened through this API. The
+// no-new-privileges, the daemon's default seccomp profile, init) are applied
+// unconditionally via the shared isolation preset and cannot be weakened. The
 // tunable knobs (CPU/memory/PID caps, network, timeout) live on Limits.
 package sandbox
 
@@ -29,7 +29,9 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -82,18 +84,23 @@ type Job struct {
 	WorkDir string            // working directory inside the container
 	Mounts  []Mount           // trusted, read-only bind mounts into the container
 
-	// InputTar is an OPTIONAL tar archive of files/dirs injected INTO the
-	// container's own writable filesystem after create and before start, via
-	// docker CopyToContainer. This is the safe way to hand untrusted code a
-	// writable source tree: it lands on ephemeral tmpfs inside the container,
-	// not a host bind mount, so the workload cannot reach the host filesystem.
-	// A `git archive` tarball can be passed straight in.
+	// InputTar is an OPTIONAL tar archive of files/dirs handed to the workload as
+	// a writable source tree, with no path back to the host filesystem. This is
+	// the safe way to give untrusted code (e.g. `go test`) something to run on. A
+	// `git archive` tarball can be passed straight in.
 	//
-	// The archive is unpacked at InputDir, so tar entry paths are relative to
-	// InputDir (e.g. an entry "main.go" becomes <InputDir>/main.go). InputDir
-	// is automatically backed by a writable tmpfs mount (unless it is already
-	// under one of the preset tmpfs paths or a Mount target), satisfying the
-	// read-only rootfs. Set WorkDir to InputDir (or a subdir) to run Cmd there.
+	// It is injected into an ephemeral named VOLUME mounted at InputDir, not a
+	// host bind mount: a trusted prep container creates the volume, chmods it so
+	// the non-root run user can write, and the tar is copied in while that prep
+	// container is running. The hardened main container then mounts the populated
+	// volume; the volume is removed when RunOnce returns. (Copying into the
+	// stopped main container instead would land on its rootfs and block the
+	// volume from mounting — hence the prep step.)
+	//
+	// The image must provide a POSIX shell with `chmod` and `sleep` (busybox,
+	// alpine, debian, golang, … all qualify). Tar entry paths are relative to
+	// InputDir (entry "main.go" -> <InputDir>/main.go). Set WorkDir to InputDir
+	// (or a subdir) to run Cmd there.
 	InputTar io.Reader
 	InputDir string // absolute dir the InputTar is unpacked into; defaults to "/workspace"
 
@@ -122,6 +129,8 @@ type dockerClient interface {
 	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
 	CopyFromContainer(ctx context.Context, containerID, srcPath string) (io.ReadCloser, container.PathStat, error)
 	CopyToContainer(ctx context.Context, containerID, dstPath string, content io.Reader, options container.CopyToContainerOptions) error
+	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
+	VolumeRemove(ctx context.Context, volumeID string, force bool) error
 }
 
 // DefaultInputDir is where Job.InputTar is unpacked when Job.InputDir is empty.
@@ -132,7 +141,7 @@ const DefaultInputDir = "/workspace"
 // hardened isolation preset. It is pure (no Docker calls) so it can be unit
 // tested without a daemon. AutoRemove is deliberately left false: we copy
 // artifacts out AFTER the container exits and then remove it ourselves.
-func buildSpec(j Job) (*container.Config, *container.HostConfig) {
+func buildSpec(j Job, inputVolume string) (*container.Config, *container.HostConfig) {
 	env := make([]string, 0, len(j.Env))
 	for k, v := range j.Env {
 		env = append(env, k+"="+v)
@@ -157,10 +166,20 @@ func buildSpec(j Job) (*container.Config, *container.HostConfig) {
 		"/workspace": "rw,size=512m,mode=1777",
 		"/tmp":       "rw,size=128m",
 	}
-	// Ensure the input dir is writable so CopyToContainer can unpack into it.
-	// If it already sits under a preset tmpfs path it is covered; otherwise add
-	// a dedicated tmpfs mount for it.
-	if dir := inputDir(j); !coveredByTmpfs(dir, tmpfs) {
+
+	// The input dir must be writable. When a tar is injected, CopyToContainer
+	// runs BEFORE the container starts — but tmpfs mounts only materialize at
+	// start, so a pre-start copy would land on the read-only rootfs and fail.
+	// Back it with a named VOLUME (exists at create time, no host path) that
+	// runOnce has already chmod'd 0777 via an init container so the non-root run
+	// user can write into it. Without an injected tar, tmpfs is fine since all
+	// writes happen at runtime after start.
+	var volMounts []mount.Mount
+	dir := inputDir(j)
+	if inputVolume != "" {
+		delete(tmpfs, dir)
+		volMounts = append(volMounts, mount.Mount{Type: mount.TypeVolume, Source: inputVolume, Target: dir})
+	} else if !coveredByTmpfs(dir, tmpfs) {
 		tmpfs[dir] = "rw,size=512m,mode=1777"
 	}
 
@@ -173,6 +192,7 @@ func buildSpec(j Job) (*container.Config, *container.HostConfig) {
 		AutoRemove:  false,
 	}.HostConfig()
 
+	preset.Mounts = append(preset.Mounts, volMounts...)
 	for _, m := range j.Mounts {
 		preset.Binds = append(preset.Binds, bindString(m))
 	}
@@ -232,7 +252,28 @@ func runOnce(ctx context.Context, cli dockerClient, j Job) (Result, error) {
 		return Result{}, err
 	}
 
-	cfg, hostCfg := buildSpec(j)
+	// When injecting a source tree, back the workdir with a named volume (no
+	// host path, writable at create time for the pre-start CopyToContainer).
+	// The volume's mount point is created root-owned, so a short init container
+	// chmods it 0777 before the hardened non-root container runs.
+	var inputVolume string
+	if j.InputTar != nil {
+		v, err := cli.VolumeCreate(ctx, volume.CreateOptions{})
+		if err != nil {
+			return Result{}, fmt.Errorf("sandbox: create input volume: %w", err)
+		}
+		inputVolume = v.Name
+		defer func() { _ = cli.VolumeRemove(context.WithoutCancel(ctx), inputVolume, true) }()
+		// Populate + chmod the volume via a RUNNING prep container. The source
+		// must be copied while a container with the volume actively mounted is
+		// running — copying into a stopped container lands on its rootfs and then
+		// blocks the volume from mounting in the main container.
+		if err := prepInputVolume(ctx, cli, j.Image, inputVolume, inputDir(j), j.InputTar); err != nil {
+			return Result{}, err
+		}
+	}
+
+	cfg, hostCfg := buildSpec(j, inputVolume)
 	created, err := cli.ContainerCreate(ctx, cfg, hostCfg, &network.NetworkingConfig{}, nil, "")
 	if err != nil {
 		return Result{}, fmt.Errorf("sandbox: container create: %w", err)
@@ -242,16 +283,11 @@ func runOnce(ctx context.Context, cli dockerClient, j Job) (Result, error) {
 	// Guaranteed teardown. Force-remove copes with a container still running
 	// (e.g. an early error) and with AutoRemove being off.
 	defer func() {
-		_ = cli.ContainerRemove(context.WithoutCancel(ctx), id, container.RemoveOptions{Force: true})
+		_ = cli.ContainerRemove(context.WithoutCancel(ctx), id, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	}()
 
-	// Inject the source tree into the container's own writable tmpfs BEFORE
-	// start, so untrusted code runs on an ephemeral copy with no host path.
-	if j.InputTar != nil {
-		if err := cli.CopyToContainer(ctx, id, inputDir(j), j.InputTar, container.CopyToContainerOptions{}); err != nil {
-			return Result{}, fmt.Errorf("sandbox: inject input tar at %s: %w", inputDir(j), err)
-		}
-	}
+	// (Source injection already happened into the input volume via the prep
+	// container above; the main container just mounts the populated volume.)
 
 	// runCtx bounds the whole run by the wall-clock Timeout. When it fires we
 	// SIGKILL the container so ContainerWait unblocks.
@@ -294,6 +330,47 @@ func runOnce(ctx context.Context, cli dockerClient, j Job) (Result, error) {
 	}
 
 	return res, nil
+}
+
+// prepInputVolume populates and permissions the freshly-created input volume so
+// the hardened non-root main container can both read the injected source and
+// write outputs into the workdir. It runs a short, trusted prep container (as
+// root) that chmods the mount point 0777 and then idles; while it is RUNNING
+// (so the volume is actively mounted) the source tar is copied IN — copying into
+// a stopped container would land on its rootfs and block the volume from
+// mounting in the main container. The prep container runs no untrusted code and
+// is always removed.
+//
+// The image must provide a POSIX shell with `chmod` and `sleep` (busybox,
+// alpine, debian, golang, … all do).
+func prepInputVolume(ctx context.Context, cli dockerClient, image, vol, dir string, tar io.Reader) error {
+	cfg := &container.Config{
+		Image: image,
+		// chmod the mount point, then idle so we can copy into the live volume.
+		Cmd: []string{"sh", "-c", "chmod 0777 '" + dir + "' && sleep 3600"},
+	}
+	hostCfg := &container.HostConfig{
+		AutoRemove: false,
+		Mounts:     []mount.Mount{{Type: mount.TypeVolume, Source: vol, Target: dir}},
+	}
+	created, err := cli.ContainerCreate(ctx, cfg, hostCfg, &network.NetworkingConfig{}, nil, "")
+	if err != nil {
+		return fmt.Errorf("sandbox: prep container create: %w", err)
+	}
+	id := created.ID
+	defer func() {
+		_ = cli.ContainerKill(context.WithoutCancel(ctx), id, "SIGKILL")
+		_ = cli.ContainerRemove(context.WithoutCancel(ctx), id, container.RemoveOptions{Force: true})
+	}()
+	if err := cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+		return fmt.Errorf("sandbox: prep container start: %w", err)
+	}
+	if tar != nil {
+		if err := cli.CopyToContainer(ctx, id, dir, tar, container.CopyToContainerOptions{}); err != nil {
+			return fmt.Errorf("sandbox: inject input tar at %s: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 // ensureImage pulls ref only if it is not already present locally.

@@ -1,6 +1,9 @@
 package isolation
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPreset_HostConfigAppliesHardenedFlags(t *testing.T) {
 	hc := Preset{
@@ -23,8 +26,15 @@ func TestPreset_HostConfigAppliesHardenedFlags(t *testing.T) {
 	for _, o := range hc.SecurityOpt {
 		sec[o] = true
 	}
-	if !sec["no-new-privileges"] || !sec["seccomp=default"] {
-		t.Errorf("SecurityOpt = %v", hc.SecurityOpt)
+	// seccomp is intentionally NOT set: the daemon applies its built-in default
+	// profile when no seccomp opt is given ("seccomp=default" is unparseable).
+	if !sec["no-new-privileges"] {
+		t.Errorf("SecurityOpt = %v, want no-new-privileges", hc.SecurityOpt)
+	}
+	for _, o := range hc.SecurityOpt {
+		if strings.HasPrefix(o, "seccomp=") {
+			t.Errorf("seccomp opt must not be set explicitly: %q", o)
+		}
 	}
 	if hc.Init == nil || !*hc.Init {
 		t.Error("Init must be true")

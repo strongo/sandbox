@@ -59,8 +59,11 @@ func (p Preset) HostConfig() *container.HostConfig {
 		Init:           &initTrue,
 		ReadonlyRootfs: true,
 		CapDrop:        strslice.StrSlice{"ALL"},
-		SecurityOpt:    []string{"no-new-privileges", "seccomp=default"},
-		Tmpfs:          p.Tmpfs,
+		// Omitting an explicit seccomp opt makes the daemon apply its built-in
+		// default profile. Passing "seccomp=default" instead makes Docker try to
+		// parse "default" as a profile JSON and fail at container start.
+		SecurityOpt: []string{"no-new-privileges"},
+		Tmpfs:       p.Tmpfs,
 	}
 	if p.NetworkMode != "" {
 		hc.NetworkMode = container.NetworkMode(p.NetworkMode)
