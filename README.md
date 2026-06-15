@@ -9,6 +9,19 @@ user, no-new-privileges, default seccomp, init) is applied unconditionally via
 the `isolation` subpackage and cannot be weakened through the public API. Only
 the tunable knobs (CPU / memory / PID caps, network, timeout) are exposed.
 
+<!-- dev-approach:v1 -->
+## Our approach to development
+
+We build with our own tooling:
+
+- **[SpecScore](https://specscore.md)** — specify requirements as `SpecScore.md` artifacts
+- **[SpecStudio](https://specscore.studio)** — author & manage specs across their lifecycle
+- **[inGitDB](https://ingitdb.com)** — store structured data in Git where applicable
+- **[DALgo](https://dalgo.io)** — data access layer for Go
+- **[cover100.dev](https://cover100.dev)** — drive toward 100% test coverage
+- **[DataTug](https://datatug.io)** — query & explore data
+<!-- /dev-approach -->
+
 ## Packages
 
 - `github.com/strongo/sandbox` — `RunOnce`, `Job`, `Limits`, `Mount`, `Result`.
