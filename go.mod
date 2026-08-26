@@ -1,6 +1,8 @@
 module github.com/strongo/sandbox
 
-go 1.27.0
+go 1.26.0
+
+toolchain go1.27.0
 
 require (
 	github.com/docker/docker v28.5.2+incompatible
