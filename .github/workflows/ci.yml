@@ -28,8 +28,11 @@ jobs:
     uses: strongo/cicd/.github/workflows/workflow.yml@main
     secrets:
       gh_token: ${{ secrets.GITHUB_TOKEN }}
+    with:
+      min_test_coverage_percent: 100
 
   # Real-Docker integration test (RunOnce against a live daemon). The unit
+
   # tests skip it unless SANDBOX_INTEGRATION is set; GitHub-hosted ubuntu
   # runners ship a running Docker daemon, so we enable it here.
   integration:

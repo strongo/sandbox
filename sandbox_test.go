@@ -152,18 +152,57 @@ func TestReadSingleFileTar_SkipsDirEntries(t *testing.T) {
 	}
 }
 
+func TestReadSingleFileTar_CorruptTar(t *testing.T) {
+	if _, ok := readSingleFileTar(strings.NewReader("not a valid tar"), "x.out"); ok {
+		t.Error("want ok=false for corrupt tar")
+	}
+}
+
+func TestReadSingleFileTar_SkipsOtherRegularFiles(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	_ = tw.WriteHeader(&tar.Header{Name: "other.txt", Mode: 0o644, Size: 5, Typeflag: tar.TypeReg})
+	_, _ = tw.Write([]byte("other"))
+	_ = tw.WriteHeader(&tar.Header{Name: "wanted.txt", Mode: 0o644, Size: 6, Typeflag: tar.TypeReg})
+	_, _ = tw.Write([]byte("wanted"))
+	_ = tw.Close()
+
+	got, ok := readSingleFileTar(&buf, "wanted.txt")
+	if !ok || string(got) != "wanted" {
+		t.Errorf("got %q ok=%v, want 'wanted'", got, ok)
+	}
+}
+
+func TestReadSingleFileTar_TruncatedBody(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	_ = tw.WriteHeader(&tar.Header{Name: "truncated.txt", Mode: 0o644, Size: 100, Typeflag: tar.TypeReg})
+	_, _ = tw.Write([]byte("short"))
+	// Intentionally don't close cleanly and truncate stream
+	raw := buf.Bytes()
+	if _, ok := readSingleFileTar(bytes.NewReader(raw), "truncated.txt"); ok {
+		t.Error("want ok=false for truncated tar body")
+	}
+}
+
 // --- fake docker client for runOnce ---
 
 type fakeClient struct {
-	inspectErr error // non-nil => image absent, triggers pull
-	pulled     bool
-	waitCode   int64
-	waitErr    error // delivered on errCh instead of waitCh
-	logs       []byte
-	artifacts  map[string][]byte // srcPath -> file bytes
-	killed     bool
-	removed    bool
-	started    bool
+	inspectErr      error // non-nil => image absent, triggers pull
+	pullErr         error
+	createErr       error
+	startErr        error
+	volumeCreateErr error
+	logsErr         error
+	rawLogs         []byte
+	pulled          bool
+	waitCode        int64
+	waitErr         error // delivered on errCh instead of waitCh
+	logs            []byte
+	artifacts       map[string][]byte // srcPath -> file bytes
+	killed          bool
+	removed         bool
+	started         bool
 
 	copyToErr   error  // forced error from CopyToContainer
 	copyToDst   string // captured dstPath
@@ -178,13 +217,22 @@ func (f *fakeClient) ImageInspect(ctx context.Context, id string, _ ...client.Im
 	return image.InspectResponse{}, f.inspectErr
 }
 func (f *fakeClient) ImagePull(ctx context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
+	if f.pullErr != nil {
+		return nil, f.pullErr
+	}
 	f.pulled = true
 	return io.NopCloser(strings.NewReader("pulling...")), nil
 }
 func (f *fakeClient) ContainerCreate(ctx context.Context, _ *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+	if f.createErr != nil {
+		return container.CreateResponse{}, f.createErr
+	}
 	return container.CreateResponse{ID: "cid-1"}, nil
 }
 func (f *fakeClient) ContainerStart(ctx context.Context, _ string, _ container.StartOptions) error {
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.started = true
 	return nil
 }
@@ -199,6 +247,12 @@ func (f *fakeClient) ContainerWait(ctx context.Context, _ string, _ container.Wa
 	return wc, ec
 }
 func (f *fakeClient) ContainerLogs(ctx context.Context, _ string, _ container.LogsOptions) (io.ReadCloser, error) {
+	if f.logsErr != nil {
+		return nil, f.logsErr
+	}
+	if f.rawLogs != nil {
+		return io.NopCloser(bytes.NewReader(f.rawLogs)), nil
+	}
 	// Frame the logs as a stdout-multiplexed stream so stdcopy decodes them.
 	var buf bytes.Buffer
 	w := stdcopy.NewStdWriter(&buf, stdcopy.Stdout)
@@ -214,9 +268,13 @@ func (f *fakeClient) ContainerRemove(ctx context.Context, _ string, _ container.
 	return nil
 }
 func (f *fakeClient) VolumeCreate(ctx context.Context, _ volume.CreateOptions) (volume.Volume, error) {
+	if f.volumeCreateErr != nil {
+		return volume.Volume{}, f.volumeCreateErr
+	}
 	f.volumeCreated = true
 	return volume.Volume{Name: "vol-1"}, nil
 }
+
 func (f *fakeClient) VolumeRemove(ctx context.Context, _ string, _ bool) error {
 	f.volumeRemoved = true
 	return nil
@@ -437,4 +495,104 @@ func TestBuildSpec_InputDirUnderWorkspaceReusesTmpfs(t *testing.T) {
 	if _, ok := hc.Tmpfs["/workspace/src"]; ok {
 		t.Error("/workspace/src should reuse /workspace tmpfs, not add its own")
 	}
+}
+
+func TestRunOnce_EnsureImage_PullError(t *testing.T) {
+	fc := &fakeClient{
+		inspectErr: io.ErrUnexpectedEOF,
+		pullErr:    io.ErrClosedPipe,
+	}
+	_, err := runOnce(context.Background(), fc, Job{Image: "runner"})
+	if err == nil {
+		t.Fatal("want error when pull fails")
+	}
+}
+
+func TestRunOnce_VolumeCreateError(t *testing.T) {
+	fc := &fakeClient{volumeCreateErr: io.ErrClosedPipe}
+	_, err := runOnce(context.Background(), fc, Job{
+		Image:    "runner",
+		InputTar: strings.NewReader("data"),
+	})
+	if err == nil {
+		t.Fatal("want error when VolumeCreate fails")
+	}
+}
+
+func TestRunOnce_PrepContainerCreateError(t *testing.T) {
+	fc := &fakeClient{createErr: io.ErrClosedPipe}
+	_, err := runOnce(context.Background(), fc, Job{
+		Image:    "runner",
+		InputTar: strings.NewReader("data"),
+	})
+	if err == nil {
+		t.Fatal("want error when prep ContainerCreate fails")
+	}
+}
+
+func TestRunOnce_PrepContainerStartError(t *testing.T) {
+	fc := &fakeClient{startErr: io.ErrClosedPipe}
+	_, err := runOnce(context.Background(), fc, Job{
+		Image:    "runner",
+		InputTar: strings.NewReader("data"),
+	})
+	if err == nil {
+		t.Fatal("want error when prep ContainerStart fails")
+	}
+}
+
+func TestRunOnce_MainContainerCreateError(t *testing.T) {
+	fc := &fakeClient{createErr: io.ErrClosedPipe}
+	_, err := runOnce(context.Background(), fc, Job{Image: "runner"})
+	if err == nil {
+		t.Fatal("want error when main ContainerCreate fails")
+	}
+}
+
+func TestRunOnce_MainContainerStartError(t *testing.T) {
+	fc := &fakeClient{startErr: io.ErrClosedPipe}
+	_, err := runOnce(context.Background(), fc, Job{Image: "runner"})
+	if err == nil {
+		t.Fatal("want error when main ContainerStart fails")
+	}
+}
+
+func TestCollectLogs_Errors(t *testing.T) {
+	// ContainerLogs error
+	fc := &fakeClient{logsErr: io.ErrClosedPipe}
+	logs := collectLogs(context.Background(), fc, "cid")
+	if logs != nil {
+		t.Errorf("expected nil logs on ContainerLogs error, got %v", logs)
+	}
+
+	// stdcopy error with partial logs recovered
+	var validBuf bytes.Buffer
+	w := stdcopy.NewStdWriter(&validBuf, stdcopy.Stdout)
+	_, _ = w.Write([]byte("partial logs"))
+	validBuf.WriteString("invalid trailing frame header")
+	fc2 := &fakeClient{rawLogs: validBuf.Bytes()}
+	logs2 := collectLogs(context.Background(), fc2, "cid")
+	if string(logs2) != "partial logs" {
+		t.Errorf("expected 'partial logs' on stdcopy error, got %q", string(logs2))
+	}
+}
+
+func TestRunOnce_PublicEntrypoint(t *testing.T) {
+
+	t.Run("client_creation_error", func(t *testing.T) {
+		t.Setenv("DOCKER_TLS_VERIFY", "1")
+		t.Setenv("DOCKER_CERT_PATH", "/nonexistent/docker/tls/cert/path")
+		_, err := RunOnce(context.Background(), Job{})
+		if err == nil {
+			t.Fatal("expected error with invalid DOCKER_CERT_PATH")
+		}
+	})
+
+	t.Run("client_created_connection_error", func(t *testing.T) {
+		t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
+		_, err := RunOnce(context.Background(), Job{Image: "runner"})
+		if err == nil {
+			t.Fatal("expected error connecting to non-existent docker daemon")
+		}
+	})
 }
